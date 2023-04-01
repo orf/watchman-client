@@ -1,7 +1,6 @@
 import asyncio
 import time
-
-import watchman_client
+from unittest.mock import ANY
 import pytest
 
 
@@ -18,8 +17,8 @@ async def test_capabilities(watchman_test_client):
 
 @pytest.mark.asyncio
 async def test_subscription(watchman_test_client, tmp_path):
-    await watchman_test_client.query("watch-project", str(tmp_path))
-    await watchman_test_client.query("subscribe", str(tmp_path), "foobar", {})
+    await watchman_test_client.query("watch-project", tmp_path)
+    await watchman_test_client.query("subscribe", tmp_path, "foobar", {})
     (tmp_path / "foo").write_text("foobar")
     await watchman_test_client.pump(tmp_path)
     assert watchman_test_client.active_roots == [tmp_path]
@@ -48,11 +47,24 @@ async def test_log(watchman_test_client):
 
 
 @pytest.mark.asyncio
+async def test_files_changed(watchman_test_client, tmp_path):
+    await watchman_test_client.query("watch-project", tmp_path)
+    await watchman_test_client.query("subscribe", tmp_path, "foobar", {})
+    (tmp_path / "foo").write_text("foobar")
+
+    iterator = watchman_test_client.files_changed()
+    result = await iterator.__anext__()
+    assert result == (tmp_path, "foobar", [
+        {"exists": True, "mode": ANY, "name": "foo", "new": True, "size": ANY}
+    ])
+
+
+@pytest.mark.asyncio
 async def test_concurrent_access(watchman_test_client, tmp_path):
     # Multiple tasks using the client requires a lock, as the readers cannot be used by >1 task.
     # This test triggers the race condition nicely.
-    await watchman_test_client.query("watch-project", str(tmp_path))
-    await watchman_test_client.query("subscribe", str(tmp_path), "foobar", {})
+    await watchman_test_client.query("watch-project", tmp_path)
+    await watchman_test_client.query("subscribe", tmp_path, "foobar", {})
     (tmp_path / "foo").write_text("foobar")
 
     async def version_task():

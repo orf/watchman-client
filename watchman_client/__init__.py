@@ -1,16 +1,15 @@
 import collections
-import subprocess
+import pathlib
 from functools import lru_cache
-import shutil
 import json
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 import asyncio
-from typing import Optional, Tuple, List, TypeAlias, Union, Dict, Set
+from typing import Optional, Tuple, List, TypeAlias, Union, Dict, Set, Any
 from os import PathLike
 
-JSON: TypeAlias = Union[dict[str, "JSON"], list["JSON"], str, int, float, bool, None]
+JSON: TypeAlias = Union[dict[str, "JSON"], list["JSON"], str, int, float, bool, None, PathLike]
 
 
 @dataclass()
@@ -64,11 +63,24 @@ class WatchmanError(Exception):
     pass
 
 
+class JsonEncoder(json.JSONEncoder):
+    def default(self, o: Any) -> Any:
+        if isinstance(o, Path):
+            return str(o)
+        return super().default(o)
+
+
 class Client:
     _connection: Optional[Tuple[asyncio.StreamReader, asyncio.StreamWriter]]
     _subscriptions: Dict[Path, Dict[str, List[JSON]]]
     _unix_socket: Optional[PathLike]
-    _lock: asyncio.Lock
+    _receive_task: Optional[asyncio.Task]
+    _files_changed: asyncio.Event
+
+    _sync_message_lock: asyncio.Lock
+    _sync_message_condition: asyncio.Condition
+    _last_sync_message: Optional[JSON]
+
     logs: collections.deque
     info = Optional[WatchmanInfo]
 
@@ -78,15 +90,67 @@ class Client:
             lambda: collections.defaultdict(list)
         )
         self._unix_socket = unix_socket
-        self._lock = asyncio.Lock()
+        self._receive_task = None
+        self._files_changed = asyncio.Event()
+
+        self._sync_message_lock = asyncio.Lock()
+        self._sync_message_condition = asyncio.Condition()
+        self._last_sync_message = None
+
         self.logs = collections.deque(maxlen=25)
         self.info = None
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> 'Client':
         await self.get_connection()
+        return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        pass
+        self._receive_task.cancel()
+        try:
+            await self._receive_task
+        except asyncio.CancelledError:
+            pass
+
+    async def get_connection(self) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        if self._connection is None:
+            self.info = await get_watchman_info(self._unix_socket)
+            self._connection = await asyncio.open_unix_connection(self.info.sockname)
+            self._receive_task = asyncio.create_task(self.receive_task())
+        return self._connection
+
+    def _handle_unilateral_response(self, response: Dict[str, JSON]) -> bool:
+        if "subscription" in response:
+            subscription_name = response["subscription"]
+            root = Path(response["root"])
+            self._subscriptions[root][subscription_name].append(response)
+            return True
+        elif "log" in response:
+            self.logs.append(response["log"])
+        return False
+
+    async def receive_task(
+            self, timeout: Optional[float] = None
+    ):
+        reader, _ = await self.get_connection()
+        while True:
+            response_bytes = await reader.readline()
+            unilateral, response = parse_response(response_bytes)
+            if unilateral:
+                if self._handle_unilateral_response(response):
+                    self._files_changed.set()
+                continue
+            if "error" in response:
+                response = WatchmanError(response["error"])
+            async with self._sync_message_condition:
+                self._last_sync_message = response
+                self._sync_message_condition.notify()
+
+    async def receive_sync_response(self) -> JSON:
+        if not self._sync_message_lock.locked():
+            raise RuntimeError("Sync message lock is not acquired")
+        async with self._sync_message_condition:
+            await self._sync_message_condition.wait()
+            return self._last_sync_message
 
     @property
     def active_roots(self) -> List[Path]:
@@ -100,24 +164,8 @@ class Client:
             for name in self._subscriptions[root].keys()
         ]
 
-    async def get_connection(self) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        if self._connection is None:
-            self.info = await get_watchman_info(self._unix_socket)
-            self._connection = await asyncio.open_unix_connection(self.info.sockname)
-        return self._connection
-
-    def handle_unilateral_response(self, response: Dict[str, JSON]):
-        if "subscription" in response:
-            subscription_name = response["subscription"]
-            root = Path(response["root"])
-            self._subscriptions[root][subscription_name].append(response)
-            # self._subscriptions_by_root[root][subscription_name] = sub_list
-            # sub_list.append(response)
-        elif "log" in response:
-            self.logs.append(response["log"])
-
     def get_subscription_data(
-        self, root: PathLike, name: str, *, remove=True
+            self, root: PathLike, name: str, *, remove=True
     ) -> List[JSON]:
         root = Path(root)
         if root not in self._subscriptions:
@@ -129,44 +177,29 @@ class Client:
             return self._subscriptions[root].pop(name)
         return self._subscriptions[root][name]
 
-    async def receive_response(
-        self, timeout: Optional[float] = None
-    ) -> Dict[str, JSON]:
-        async with self._lock:
-            reader, _ = await self.get_connection()
-            while True:
-                async with asyncio.timeout(timeout):
-                    response_bytes = await reader.readline()
-                unilateral, response = parse_response(response_bytes)
-                if unilateral:
-                    self.handle_unilateral_response(response)
-                    continue
-                if "error" in response:
-                    raise WatchmanError(response["error"])
-                return response
-
     async def send_command(
-        self, command: List[JSON], *, timeout: Optional[float] = None
+            self, command: List[JSON], *, timeout: Optional[float] = None
     ) -> Dict[str, JSON]:
         _, writer = await self.get_connection()
-        writer.write(f"{json.dumps(command)}\n".encode())
-        await writer.drain()
-        return await self.receive_response(timeout)
+        async with self._sync_message_lock:
+            writer.write(f"{json.dumps(command, cls=JsonEncoder)}\n".encode())
+            await writer.drain()
+            return await self.receive_sync_response()
 
     async def capabilities(self) -> Dict[str, JSON]:
         return await self.query("list-capabilities")
 
     async def query(
-        self, command: str, *args: JSON, timeout: Optional[float] = None
+            self, command: str, *args: JSON, timeout: Optional[float] = None
     ) -> Dict[str, JSON]:
         return await self.send_command([command, *args], timeout=timeout)
 
     async def pump(
-        self,
-        root: PathLike,
-        *,
-        sync_timeout: int = 100,
-        timeout: Optional[float] = None,
+            self,
+            root: PathLike,
+            *,
+            sync_timeout: int = 100,
+            timeout: Optional[float] = None,
     ):
         await self.query(
             "flush-subscriptions",
@@ -176,7 +209,24 @@ class Client:
         )
 
     async def pump_all(
-        self, *, sync_timeout: int = 100, timeout: Optional[float] = None
+            self, *, sync_timeout: int = 100, timeout: Optional[float] = None
     ):
         for root in self._subscriptions:
             await self.pump(root, sync_timeout=sync_timeout, timeout=timeout)
+
+    async def root_clock(self, root: PathLike):
+        response = await self.query("clock", root)
+        return response["clock"]
+
+    async def files_changed(self):
+        while True:
+            await self._files_changed.wait()
+
+            for (root, sub_name) in self.active_subscriptions:
+                sub_data = self.get_subscription_data(root, sub_name)
+                for item in sub_data:
+                    if item["files"]:
+                        yield root, sub_name, item
+
+            self._subscriptions.clear()
+            self._files_changed.clear()
