@@ -22,3 +22,7 @@ async with Client() as client:
         for file in items["files"]:
             print(f'Changed: {root_path / file["name"]}')
 ```
+
+## Example CLI
+
+Run `python -m watchman_client` to launch an example CLI that watches for changes in the current directory.
